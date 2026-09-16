@@ -77,3 +77,155 @@ class DepthBlobSegmenter:
                 })
 
         return clean_mask, retained_blobs, edge_mask
+
+
+class HeadLocalizer:
+    """
+    Per-blob head extraction, following Section 3 of Bondi et al.[cite: 1],
+    with an added spatial-connectivity pass so that two people who were
+    fused into a single blob by the Sobel edge-splitting step still yield
+    two separate head detections, provided their heads are not touching.
+
+    For each blob B with pixel set P = {(x1,y1), ..., (xn,yn)}, the paper
+    computes d_hat = min_p D(x,y) -- the closest (smallest depth) point in
+    the blob -- then retains only pixels whose depth falls in the band
+    [d_hat, d_hat + epsilon]. Because the head is the topmost, closest-to
+    -camera part of a person in an overhead/angled RGB-D view, this band
+    isolates the head region(s) and discards the rest of the body[cite: 1].
+
+    IMPORTANT REFINEMENT: the paper's description implicitly assumes one
+    head per blob, but a single blob can legitimately contain more than
+    one head (e.g. two people standing close enough that the Sobel edge
+    mask does not fully separate their bodies, while their heads are still
+    spatially distinct at the top of the blob). Taking a single global
+    min/max over the whole depth-band mask would silently merge two heads
+    into one oversized bounding box. To avoid this, the depth-band mask
+    for each blob is itself run through connected-component labeling, and
+    each spatially-disconnected sub-region becomes its own head detection
+    with its own bounding box.
+    """
+
+    def __init__(self, epsilon: float = 150.0, min_head_area: int = 20,
+                 morph_kernel_size: int = 3):
+        """
+        Args:
+            epsilon: depth band width (in the same units as the depth map,
+                typically mm) added to the blob's minimum depth d_hat to
+                define the retained range [d_hat, d_hat + epsilon][cite: 1].
+            min_head_area: minimum pixel count for a candidate head region
+                to be kept, filtering out noise fragments.
+            morph_kernel_size: size of the morphological closing kernel
+                applied to the depth-band mask before splitting it into
+                sub-regions. This bridges small 1-2 pixel depth-noise gaps
+                *within* a single real head so it isn't spuriously split
+                into fragments, without being large enough to bridge the
+                genuine gap between two separate people's heads. Set to 0
+                or 1 to disable.
+        """
+        self.epsilon = float(epsilon)
+        self.min_head_area = int(min_head_area)
+        self.morph_kernel_size = int(morph_kernel_size)
+
+    def process(self, depth_frame: np.ndarray, blobs: list):
+        """
+        Args:
+            depth_frame: raw depth map (same frame passed to the segmenter).
+            blobs: list of blob dicts produced by DepthBlobSegmenter.process,
+                each containing at least 'id', 'mask', 'bbox'.
+
+        Returns:
+            head_mask: uint8 mask (255 at retained head pixels) for display,
+                analogous to panel "Head detection" in Figure 1 of the paper.
+            heads: list of dicts, one per surviving, spatially-disconnected
+                head region, each with 'head_id' (globally unique within
+                the frame), 'blob_id' (the parent blob it came from --
+                multiple heads can share the same blob_id when a blob was
+                split), 'split_from_shared_blob' (True if this head's
+                parent blob yielded more than one head), 'mask', 'bbox',
+                'centroid', 'top_point', 'depth_min', 'area'. 'top_point'
+                is the highest (smallest image-y) pixel in the head region
+                -- this is what Section 4 later back-projects onto the
+                ground plane[cite: 1].
+        """
+        depth_float = depth_frame.astype(np.float32)
+        head_mask = np.zeros(depth_frame.shape[:2], dtype=np.uint8)
+        heads = []
+        head_counter = 0
+
+        use_morph = self.morph_kernel_size and self.morph_kernel_size > 1
+        if use_morph:
+            morph_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (self.morph_kernel_size, self.morph_kernel_size)
+            )
+
+        for blob in blobs:
+            blob_mask = blob['mask']
+
+            # 1. d_hat = min_p D(x, y) over the blob's pixels[cite: 1].
+            #    Ignore zero/invalid depth (sensor holes) when finding the min.
+            blob_depths = depth_float[blob_mask]
+            valid_depths = blob_depths[blob_depths > 0]
+            if valid_depths.size == 0:
+                continue
+            d_hat = float(valid_depths.min())
+
+            # 2. Retain pixels (x, y) of the blob with D(x, y) in
+            #    [d_hat, d_hat + epsilon][cite: 1].
+            in_band = (depth_float >= d_hat) & (depth_float <= d_hat + self.epsilon)
+            band_mask = (in_band & blob_mask).astype(np.uint8) * 255
+
+            if band_mask.max() == 0:
+                continue
+
+            # Bridge tiny depth-noise gaps within a single head before
+            # splitting, so we don't over-fragment one real head.
+            if use_morph:
+                band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, morph_kernel)
+
+            # 3. NEW: split the depth-band mask into spatially-disconnected
+            #    sub-regions. A blob that visually fused two people's bodies
+            #    can still have two separate head-height clusters -- this is
+            #    what recovers them as two head detections instead of one.
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                band_mask, connectivity=8
+            )
+            surviving_sub_regions = [
+                i for i in range(1, num_labels)
+                if stats[i, cv2.CC_STAT_AREA] >= self.min_head_area
+            ]
+            blob_was_split = len(surviving_sub_regions) > 1
+
+            for i in surviving_sub_regions:
+                sub_mask = (labels == i)
+
+                head_mask[sub_mask] = 255
+
+                x = int(stats[i, cv2.CC_STAT_LEFT])
+                y = int(stats[i, cv2.CC_STAT_TOP])
+                w = int(stats[i, cv2.CC_STAT_WIDTH])
+                h = int(stats[i, cv2.CC_STAT_HEIGHT])
+                area = int(stats[i, cv2.CC_STAT_AREA])
+
+                ys, xs = np.where(sub_mask)
+                centroid = (int(xs.mean()), int(ys.mean()))
+
+                # Highest point (smallest y) of this head sub-region -- the
+                # "top head point" the paper projects onto the ground plane
+                # in Section 4[cite: 1].
+                top_idx = int(np.argmin(ys))
+                top_point = (int(xs[top_idx]), int(ys[top_idx]))
+
+                heads.append({
+                    'head_id': head_counter,
+                    'blob_id': blob['id'],
+                    'split_from_shared_blob': blob_was_split,
+                    'mask': sub_mask,
+                    'bbox': (x, y, w, h),
+                    'centroid': centroid,
+                    'top_point': top_point,
+                    'depth_min': d_hat,
+                    'area': area,
+                })
+                head_counter += 1
+
+        return head_mask, heads

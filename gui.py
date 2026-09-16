@@ -46,7 +46,7 @@ class PipelineGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Depth Processing Setup")
-        self.root.geometry("560x320")
+        self.root.geometry("560x360")
         self.root.resizable(True, True)  # Make setup window resizable
         self.config = None
 
@@ -84,7 +84,7 @@ class PipelineGUI:
         )
         self.alpha_entry = tk.Entry(param_frame, width=12)
         self.alpha_entry.grid(row=0, column=1, sticky="w", pady=5, padx=(5, 5))
-        self.alpha_entry.insert(0, "0.01")  #[cite: 1]
+        self.alpha_entry.insert(0, "0.001")  #[cite: 1]
         q_alpha = tk.Label(
             param_frame, text="❓", cursor="question_arrow", fg="#0066cc", font=("Arial", 10, "bold")
         )
@@ -132,6 +132,25 @@ class PipelineGUI:
             "  walking closely together in a crowd.",
         )
 
+        # 4. Head Epsilon
+        tk.Label(param_frame, text="Head Epsilon (mm):").grid(
+            row=3, column=0, sticky="w", pady=5
+        )
+        self.epsilon_entry = tk.Entry(param_frame, width=12)
+        self.epsilon_entry.grid(row=3, column=1, sticky="w", pady=5, padx=(5, 5))
+        self.epsilon_entry.insert(0, "150.0")
+        q_epsilon = tk.Label(
+            param_frame, text="❓", cursor="question_arrow", fg="#0066cc", font=("Arial", 10, "bold")
+        )
+        q_epsilon.grid(row=3, column=2, sticky="w", pady=5)
+        ToolTip(
+            q_epsilon,
+            "Epsilon is the depth band retained around each blob's closest\n"
+            "point (d_hat) when isolating the head [d_hat, d_hat+epsilon].\n"
+            "• Smaller values keep only the very top of the head.\n"
+            "• Larger values may include shoulders in crowded/tilted views.",
+        )
+
         # Start Button
         tk.Button(
             root,
@@ -155,6 +174,7 @@ class PipelineGUI:
             alpha = float(self.alpha_entry.get())
             delta = float(self.delta_entry.get())
             sobel_thresh = float(self.sobel_entry.get())
+            epsilon = float(self.epsilon_entry.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "All parameters must be numbers.")
             return
@@ -173,6 +193,7 @@ class PipelineGUI:
             "alpha": alpha,
             "delta": delta,
             "sobel_thresh": sobel_thresh,
+            "epsilon": epsilon,
         }
         self.root.destroy()
 
